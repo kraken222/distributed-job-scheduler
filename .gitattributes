@@ -1,0 +1,4 @@
+# Never apply line-ending conversion to binary artifacts.
+*.pdf binary
+*.png binary
+*.db binary
