@@ -38,6 +38,22 @@ export const config = {
   reaperTickMs: int('REAPER_TICK_MS', 5000),
   /** A worker missing heartbeats for this long is considered lost. */
   workerStaleMs: int('WORKER_STALE_MS', 15000),
+  /** How often the DLQ failure summarizer looks for unsummarized entries. */
+  summaryTickMs: int('SUMMARY_TICK_MS', 5000),
+
+  // WebSocket live updates
+  /** Burst-coalescing window for change notifications. */
+  wsDebounceMs: int('WS_DEBOUNCE_MS', 200),
+  /** Poll interval for detecting other-process (worker) commits via data_version. */
+  wsVersionPollMs: int('WS_VERSION_POLL_MS', 750),
+
+  // AI failure summaries (optional; heuristic summaries otherwise)
+  /** Anthropic API key. When set, DLQ summaries are AI-generated. */
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
+  anthropicModel: process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5-20251001',
+
+  /** Comma-separated shard list this worker claims from (e.g. "0,2"); empty = all shards. */
+  workerShards: process.env.WORKER_SHARDS,
 
   logLevel: process.env.LOG_LEVEL ?? 'info',
 } as const;

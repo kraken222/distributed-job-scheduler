@@ -3,19 +3,40 @@ import { z } from 'zod';
 import type { DB } from '../../db/connection.js';
 import { assertValidCron, nextCronRun } from '../../core/cron.js';
 import { newId } from '../../core/ids.js';
-import { createBatch, createJob } from '../../core/jobService.js';
+import { createBatch, createJob, createWorkflow, DependencyError } from '../../core/jobService.js';
 import { queueStats } from '../../core/stats.js';
 import { JOB_STATUSES } from '../../types.js';
-import { getProject, getQueue, getRetryPolicy } from '../access.js';
+import { getJob, getProject, getQueue, getRetryPolicy } from '../access.js';
 import { ApiError, h, paginated, parsePagination, parseJson } from '../http.js';
 import { requireRole, validateBody } from '../middleware.js';
 
-const queueSchema = z.object({
+/** Invalid dependency graphs (unknown parent, cycle, failed parent) are client errors. */
+function mapDependencyError<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof DependencyError) throw ApiError.badRequest(err.message);
+    throw err;
+  }
+}
+
+const rateLimitTogether = { message: 'rateLimitMax and rateLimitWindowMs must be set together' };
+const queueBase = z.object({
   name: z.string().min(1).max(100).regex(/^[a-zA-Z0-9._-]+$/, 'letters, digits, dot, dash, underscore only'),
   priority: z.number().int().min(-100).max(100).default(0),
   concurrencyLimit: z.number().int().min(1).max(1000).default(10),
   retryPolicyId: z.string().nullish(),
+  /** Sliding-window rate limit; both null = unlimited. */
+  rateLimitMax: z.number().int().min(1).max(100_000).nullish(),
+  rateLimitWindowMs: z.number().int().min(100).max(24 * 3600_000).nullish(),
+  shardCount: z.number().int().min(1).max(64).optional(),
 });
+const queueSchema = queueBase.refine((q) => (q.rateLimitMax == null) === (q.rateLimitWindowMs == null), rateLimitTogether);
+const queueUpdateSchema = queueBase.partial().refine(
+  // On update the pair may be omitted entirely, but never half-set.
+  (q) => (q.rateLimitMax === undefined && q.rateLimitWindowMs === undefined) || (q.rateLimitMax == null) === (q.rateLimitWindowMs == null),
+  rateLimitTogether,
+);
 
 const jobSchema = z.object({
   type: z.string().min(1).max(200),
@@ -26,11 +47,28 @@ const jobSchema = z.object({
   timeoutMs: z.number().int().min(100).max(3600_000).optional(),
   retryPolicyId: z.string().nullish(),
   idempotencyKey: z.string().min(1).max(200).nullish(),
+  /** Existing job ids that must complete before this job runs. */
+  dependsOn: z.array(z.string().min(1)).max(20).optional(),
+  shardKey: z.string().min(1).max(200).nullish(),
 });
 
 const batchSchema = z.object({
   name: z.string().max(200).optional(),
   jobs: z.array(jobSchema).min(1).max(1000),
+});
+
+const workflowSchema = z.object({
+  name: z.string().max(200).optional(),
+  jobs: z
+    .array(
+      jobSchema.omit({ dependsOn: true }).extend({
+        key: z.string().min(1).max(100),
+        /** Here dependsOn refers to sibling `key`s, not job ids. */
+        dependsOn: z.array(z.string().min(1)).max(20).optional(),
+      }),
+    )
+    .min(1)
+    .max(200),
 });
 
 const scheduleSchema = z.object({
@@ -63,10 +101,15 @@ export function queueRoutes(db: DB): Router {
     const now = Date.now();
     const row = db
       .prepare(
-        `INSERT INTO queues (id, project_id, name, priority, concurrency_limit, retry_policy_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        `INSERT INTO queues (id, project_id, name, priority, concurrency_limit, retry_policy_id,
+                             rate_limit_max, rate_limit_window_ms, shard_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       )
-      .get(newId.queue(), project.id, req.body.name, req.body.priority, req.body.concurrencyLimit, req.body.retryPolicyId ?? null, now, now);
+      .get(
+        newId.queue(), project.id, req.body.name, req.body.priority, req.body.concurrencyLimit,
+        req.body.retryPolicyId ?? null, req.body.rateLimitMax ?? null, req.body.rateLimitWindowMs ?? null,
+        req.body.shardCount ?? 1, now, now,
+      );
     res.status(201).json(row);
   }));
 
@@ -75,12 +118,13 @@ export function queueRoutes(db: DB): Router {
     res.json({ ...queue, stats: queueStats(db, queue.id) });
   }));
 
-  r.patch('/queues/:queueId', validateBody(queueSchema.partial()), h((req, res) => {
+  r.patch('/queues/:queueId', validateBody(queueUpdateSchema), h((req, res) => {
     const queue = getQueue(db, req.params.queueId, req.user!.orgId);
     if (req.body.retryPolicyId) getRetryPolicy(db, req.body.retryPolicyId, req.user!.orgId);
     const row = db
       .prepare(
-        `UPDATE queues SET name = ?, priority = ?, concurrency_limit = ?, retry_policy_id = ?, updated_at = ?
+        `UPDATE queues SET name = ?, priority = ?, concurrency_limit = ?, retry_policy_id = ?,
+                rate_limit_max = ?, rate_limit_window_ms = ?, shard_count = ?, updated_at = ?
          WHERE id = ? RETURNING *`,
       )
       .get(
@@ -88,6 +132,9 @@ export function queueRoutes(db: DB): Router {
         req.body.priority ?? queue.priority,
         req.body.concurrencyLimit ?? queue.concurrency_limit,
         req.body.retryPolicyId === undefined ? queue.retry_policy_id : req.body.retryPolicyId,
+        req.body.rateLimitMax === undefined ? queue.rate_limit_max : req.body.rateLimitMax,
+        req.body.rateLimitWindowMs === undefined ? queue.rate_limit_window_ms : req.body.rateLimitWindowMs,
+        req.body.shardCount ?? queue.shard_count,
         Date.now(),
         queue.id,
       );
@@ -122,14 +169,29 @@ export function queueRoutes(db: DB): Router {
   r.post('/queues/:queueId/jobs', validateBody(jobSchema), h((req, res) => {
     const queue = getQueue(db, req.params.queueId, req.user!.orgId);
     if (req.body.retryPolicyId) getRetryPolicy(db, req.body.retryPolicyId, req.user!.orgId);
-    const { job, deduplicated } = createJob(db, queue.id, req.body);
+    // Tenancy: every dependency parent must be visible to the caller's org.
+    for (const parentId of req.body.dependsOn ?? []) getJob(db, parentId, req.user!.orgId);
+    const { job, deduplicated } = mapDependencyError(() => createJob(db, queue.id, req.body));
     res.status(deduplicated ? 200 : 201).json({ ...job, payload: parseJson(job.payload), deduplicated });
   }));
 
   r.post('/queues/:queueId/batches', validateBody(batchSchema), h((req, res) => {
     const queue = getQueue(db, req.params.queueId, req.user!.orgId);
-    const { batchId, jobs } = createBatch(db, queue.id, req.body);
+    for (const j of req.body.jobs) for (const parentId of j.dependsOn ?? []) getJob(db, parentId, req.user!.orgId);
+    const { batchId, jobs } = mapDependencyError(() => createBatch(db, queue.id, req.body));
     res.status(201).json({ batchId, total: jobs.length, jobIds: jobs.map((j) => j.id) });
+  }));
+
+  // ---- Workflows: a DAG of dependent jobs created atomically ----
+
+  r.post('/queues/:queueId/workflows', validateBody(workflowSchema), h((req, res) => {
+    const queue = getQueue(db, req.params.queueId, req.user!.orgId);
+    const { batchId, jobs } = mapDependencyError(() => createWorkflow(db, queue.id, req.body));
+    res.status(201).json({
+      batchId,
+      total: Object.keys(jobs).length,
+      jobs: Object.fromEntries(Object.entries(jobs).map(([key, j]) => [key, j.id])),
+    });
   }));
 
   r.get('/queues/:queueId/jobs', h((req, res) => {

@@ -57,6 +57,24 @@ export function jobRoutes(db: DB): Router {
     res.json({ data: rows });
   }));
 
+  // Workflow neighbourhood: what this job waits on, and what waits on it.
+  r.get('/jobs/:jobId/dependencies', h((req, res) => {
+    const job = getJob(db, req.params.jobId, req.user!.orgId);
+    const parents = db
+      .prepare(
+        `SELECT j.id, j.type, j.status FROM job_dependencies d JOIN jobs j ON j.id = d.depends_on
+         WHERE d.job_id = ? ORDER BY j.created_at`,
+      )
+      .all(job.id);
+    const children = db
+      .prepare(
+        `SELECT j.id, j.type, j.status FROM job_dependencies d JOIN jobs j ON j.id = d.job_id
+         WHERE d.depends_on = ? ORDER BY j.created_at`,
+      )
+      .all(job.id);
+    res.json({ parents, children, pendingDeps: job.pending_deps });
+  }));
+
   // ---- Workers (deployment-wide; read-only observability) ----
 
   r.get('/workers', h((req, res) => {

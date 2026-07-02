@@ -16,4 +16,6 @@ export const newId = {
   schedule: () => `sch_${gen()}`,
   retryPolicy: () => `rp_${gen()}`,
   dlq: () => `dlq_${gen()}`,
+  event: () => `evt_${gen()}`,
+  trigger: () => `trg_${gen()}`,
 };

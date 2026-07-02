@@ -1,8 +1,9 @@
 # Distributed Job Scheduler
 
 A production-inspired distributed job scheduling platform: REST API, horizontally-scalable
-worker fleet, retries with configurable backoff, dead letter queue, cron schedules, and a
-live web dashboard.
+worker fleet, retries with configurable backoff, dead letter queue, cron schedules,
+workflow DAGs, rate limiting, sharding, event-driven execution, and a live web dashboard
+with WebSocket updates.
 
 ![stack](https://img.shields.io/badge/stack-Node%2022%20·%20TypeScript%20·%20Express%20·%20SQLite%20·%20React-blue)
 
@@ -10,6 +11,7 @@ live web dashboard.
 
 - **Auth & multi-tenancy** — JWT auth; organizations → projects → queues → jobs. Cross-org
   access is impossible by construction (every query joins back to the caller's org).
+  RBAC: admin/member roles gate destructive operations.
 - **Queues** — priority, fleet-wide concurrency limits, pause/resume, retry policy, live stats.
 - **Job types** — immediate, delayed (`delayMs`), scheduled (`runAt`), recurring (cron), batch.
 - **Full lifecycle** — `scheduled → queued → claimed → running → completed`, with
@@ -21,10 +23,32 @@ live web dashboard.
 - **Observability** — execution history per attempt, per-job logs, worker registry with
   heartbeat history, queue stats, project throughput metrics.
 - **Dashboard** — queue health, job explorer with search/filters/pagination, job detail with
-  retry history & logs, workers, DLQ with requeue, cron schedule management, retry policy
-  management with backoff previews, and a throughput chart. Jobs can be enqueued from the UI
-  as immediate, delayed (ms), scheduled (absolute run-at time) or batch. Live updates via
-  polling; light professional theme (Inter, teal accent, dark slate sidebar).
+  retry history, logs & dependency graph, workers, DLQ with requeue and automatic failure
+  diagnoses, cron schedules, event triggers, retry policies with backoff previews, and a
+  throughput chart. Live updates over WebSocket with polling fallback; light professional
+  theme (Inter, teal accent, dark slate sidebar).
+
+### Bonus features (all eight)
+
+- **Workflow dependencies** — jobs can depend on other jobs; `POST /queues/:id/workflows`
+  creates whole DAGs atomically (cycle detection included). Children become claimable only
+  when every parent completed; a failed/canceled parent cancels its descendant subtree.
+- **Rate limiting** — per-queue sliding-window limits on execution starts (`rateLimitMax`
+  per `rateLimitWindowMs`), enforced exactly, fleet-wide, inside the claim transaction.
+- **Distributed locking** — the atomic claim transaction is the lock (SQLite `IMMEDIATE` ≙
+  Postgres `SELECT … FOR UPDATE SKIP LOCKED`); schedule firing uses an optimistic CAS.
+- **Queue sharding** — queues declare `shardCount`; jobs hash onto shards by `shardKey`
+  (same key ⇒ same shard); workers pin to shards with `WORKER_SHARDS=0,2`.
+- **Event-driven execution** — `POST /projects/:id/events` records an event and atomically
+  fans out one job per enabled trigger (event → queue/job-type subscriptions with payload
+  templates), managed from the dashboard's Events page.
+- **WebSocket live updates** — authenticated `/api/ws` pushes debounced change
+  notifications (poll-on-notify); the dashboard shows a Live indicator and degrades to
+  polling when the socket drops.
+- **RBAC** — admin/member roles; destructive operations are admin-only.
+- **AI failure summaries** — dead-lettered jobs get an automatic diagnosis: Claude-generated
+  when `ANTHROPIC_API_KEY` is set, a deterministic heuristic classifier otherwise (works
+  offline, falls back on any AI error).
 
 ## Repository layout
 
@@ -36,7 +60,7 @@ job-scheduler/
 │   │   ├── core/      # domain logic: claims, retry, scheduler, reaper, stats
 │   │   ├── db/        # SQLite connection, migrations, seed
 │   │   └── worker/    # worker runtime + job handlers
-│   └── tests/         # Vitest suite (53 tests)
+│   └── tests/         # Vitest suite (82 tests)
 ├── web/               # React dashboard (Vite)
 └── docs/              # architecture, ER diagram, API reference, design decisions
 ```
@@ -67,6 +91,12 @@ Sign in with the seeded demo account (`demo@example.com` / `demo1234`) or regist
 organization. Enqueue `demo.sleep` / `demo.flaky` / `demo.fail` jobs from the queue page and
 watch them flow through workers, retries and the DLQ.
 
+The seed also demonstrates every bonus feature: an ETL **workflow DAG** on the `reports`
+queue, a **rate-limited** `third-party-api` queue (5 starts / 10s), a **sharded**
+`per-tenant` queue (4 shards, jobs keyed by tenant), a `user.signup` **event trigger**
+(emit one from the Events page and watch it fan out), and an automatic **failure diagnosis**
+on the dead-lettered `demo.fail` job.
+
 ### Configuration (environment variables)
 
 | Variable | Default | Purpose |
@@ -76,14 +106,19 @@ watch them flow through workers, retries and the DLQ.
 | `JWT_SECRET` | dev value | **set in production** |
 | `WORKER_NAME` | `worker-<pid>` | display name of a worker |
 | `WORKER_CONCURRENCY` | `5` | jobs one worker runs at once |
+| `WORKER_SHARDS` | all shards | comma-separated shard pinning, e.g. `0,2` |
 | `LEASE_MS` | `30000` | claim lease; expired leases are recovered by the reaper |
 | `WORKER_STALE_MS` | `15000` | heartbeat age after which a worker is `lost` |
+| `ANTHROPIC_API_KEY` | unset | enables AI-generated DLQ failure summaries (heuristic otherwise) |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | model used for failure summaries |
 
 ### Tests
 
 ```bash
 cd server
-npm test          # 53 tests: retry math, atomic claims, lifecycle, reaper, cron, API, worker integration
+npm test          # 82 tests: retry math, atomic claims, lifecycle, reaper, cron, API, worker
+                  # integration, workflow DAGs, rate limiting, sharding, events, failure
+                  # summaries, WebSocket auth + notifications
 npm run typecheck
 ```
 

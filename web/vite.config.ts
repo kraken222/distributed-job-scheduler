@@ -7,7 +7,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       // Same-origin API calls in dev; the token still travels in the header.
-      '/api': 'http://localhost:4000',
+      // ws: true also tunnels the /api/ws live-update socket.
+      '/api': { target: 'http://localhost:4000', ws: true },
     },
   },
 });

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { migrate } from '../src/db/schema.js';
 import type { DB } from '../src/db/connection.js';
 import { newId } from '../src/core/ids.js';
+import { completeJob, failJob, startJob } from '../src/core/claims.js';
 
 /** Fresh in-memory database with the full schema + system retry policies. */
 export function testDb(): DB {
@@ -36,14 +37,44 @@ export function seedFixture(db: DB, queueOpts: { priority?: number; concurrency?
   return { orgId, userId, projectId, queueId };
 }
 
-export function addQueue(db: DB, projectId: string, name: string, opts: { priority?: number; concurrency?: number; paused?: boolean } = {}): string {
+export function addQueue(
+  db: DB,
+  projectId: string,
+  name: string,
+  opts: {
+    priority?: number;
+    concurrency?: number;
+    paused?: boolean;
+    rateLimitMax?: number;
+    rateLimitWindowMs?: number;
+    shardCount?: number;
+  } = {},
+): string {
   const now = Date.now();
   const id = newId.queue();
   db.prepare(
-    `INSERT INTO queues (id, project_id, name, priority, concurrency_limit, is_paused, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, projectId, name, opts.priority ?? 0, opts.concurrency ?? 10, opts.paused ? 1 : 0, now, now);
+    `INSERT INTO queues (id, project_id, name, priority, concurrency_limit, is_paused,
+                         rate_limit_max, rate_limit_window_ms, shard_count, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id, projectId, name, opts.priority ?? 0, opts.concurrency ?? 10, opts.paused ? 1 : 0,
+    opts.rateLimitMax ?? null, opts.rateLimitWindowMs ?? null, opts.shardCount ?? 1, now, now,
+  );
   return id;
+}
+
+/** Drive a claimed-or-claimable job to 'completed' through the real state machine. */
+export function runToCompletion(db: DB, workerId: string, jobId: string, now: number = Date.now()): void {
+  const started = startJob(db, jobId, workerId, now);
+  if (!started) throw new Error(`could not start job ${jobId}`);
+  completeJob(db, { jobId, executionId: started.executionId, workerId, now });
+}
+
+/** Drive a claimed job to a failed attempt (retry or dead per its policy). */
+export function runToFailure(db: DB, workerId: string, jobId: string, error = 'boom', now: number = Date.now()) {
+  const started = startJob(db, jobId, workerId, now);
+  if (!started) throw new Error(`could not start job ${jobId}`);
+  return failJob(db, { jobId, executionId: started.executionId, workerId, error, now });
 }
 
 export function addWorker(db: DB, name = 'w1'): string {

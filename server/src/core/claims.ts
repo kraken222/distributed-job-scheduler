@@ -18,24 +18,52 @@ import { newId } from './ids.js';
  *  1. queue pause state (paused queues are skipped entirely),
  *  2. per-queue concurrency limits (jobs already claimed/running count
  *     against the queue's limit fleet-wide),
- *  3. queue priority, then job priority, then run_at/created_at (FIFO).
+ *  3. per-queue sliding-window rate limits (execution starts in the window
+ *     plus claimed-but-not-yet-started jobs consume the budget),
+ *  4. workflow dependencies (jobs with incomplete parents are invisible),
+ *  5. shard pinning (a worker started with WORKER_SHARDS only sees its shards),
+ *  6. queue priority, then job priority, then run_at/created_at (FIFO).
  */
-export function claimJobs(db: DB, workerId: string, maxJobs: number, opts: { now?: number; leaseMs: number }): JobRow[] {
+export function claimJobs(
+  db: DB,
+  workerId: string,
+  maxJobs: number,
+  opts: { now?: number; leaseMs: number; shards?: number[] },
+): JobRow[] {
   const now = opts.now ?? Date.now();
   if (maxJobs <= 0) return [];
+
+  // Optional shard pinning: filter candidates to this worker's shards.
+  const shardParams: Record<string, number> = {};
+  let shardClause = '';
+  if (opts.shards && opts.shards.length > 0) {
+    shardClause = ` AND j.shard IN (${opts.shards.map((_, i) => `@sh${i}`).join(',')})`;
+    opts.shards.forEach((s, i) => (shardParams[`sh${i}`] = s));
+  }
 
   const tx = db.transaction((): JobRow[] => {
     const candidates = db
       .prepare(
         `WITH capacity AS (
            SELECT q.id AS queue_id, q.priority AS queue_priority,
-                  q.concurrency_limit - COUNT(active.id) AS free
+                  -- Free slots = MIN(concurrency headroom, rate-limit tokens).
+                  MIN(
+                    q.concurrency_limit
+                      - (SELECT COUNT(*) FROM jobs a
+                         WHERE a.queue_id = q.id AND a.status IN ('claimed','running')),
+                    CASE
+                      WHEN q.rate_limit_max IS NULL OR q.rate_limit_window_ms IS NULL THEN 1000000000
+                      ELSE q.rate_limit_max
+                        -- Execution starts inside the sliding window...
+                        - (SELECT COUNT(*) FROM job_executions e JOIN jobs je ON je.id = e.job_id
+                           WHERE je.queue_id = q.id AND e.started_at > @now - q.rate_limit_window_ms)
+                        -- ...plus claims that will imminently start (not yet in job_executions).
+                        - (SELECT COUNT(*) FROM jobs cl
+                           WHERE cl.queue_id = q.id AND cl.status = 'claimed')
+                    END
+                  ) AS free
            FROM queues q
-           LEFT JOIN jobs active
-             ON active.queue_id = q.id AND active.status IN ('claimed','running')
            WHERE q.is_paused = 0
-           GROUP BY q.id
-           HAVING free > 0
          ),
          candidates AS (
            SELECT j.id, c.queue_priority, c.free,
@@ -45,15 +73,16 @@ export function claimJobs(db: DB, workerId: string, maxJobs: number, opts: { now
                     ORDER BY j.priority DESC, j.run_at ASC, j.created_at ASC
                   ) AS rn
            FROM jobs j
-           JOIN capacity c ON c.queue_id = j.queue_id
+           JOIN capacity c ON c.queue_id = j.queue_id AND c.free > 0
            WHERE j.status IN ('queued','scheduled','retrying') AND j.run_at <= @now
+             AND j.pending_deps = 0${shardClause}
          )
          SELECT id FROM candidates
          WHERE rn <= free
          ORDER BY queue_priority DESC, job_priority DESC, run_at ASC, created_at ASC
          LIMIT @max`,
       )
-      .all({ now, max: maxJobs }) as { id: string }[];
+      .all({ now, max: maxJobs, ...shardParams }) as { id: string }[];
 
     if (candidates.length === 0) return [];
 
@@ -115,6 +144,13 @@ export function completeJob(
       .run(now, resultJson, now, args.jobId, args.workerId).changes;
     if (changed === 0) return false;
     finishExecution(db, args.executionId, 'completed', now, { result: resultJson });
+    // Workflow fan-out: children waiting on this job get one step closer to
+    // claimable; at pending_deps = 0 the claim query starts seeing them.
+    db.prepare(
+      `UPDATE jobs SET pending_deps = pending_deps - 1, updated_at = ?
+       WHERE pending_deps > 0
+         AND id IN (SELECT job_id FROM job_dependencies WHERE depends_on = ?)`,
+    ).run(now, args.jobId);
     return true;
   });
   return tx.immediate();
@@ -180,7 +216,37 @@ export function applyFailure(db: DB, job: JobRow, policy: RetryPolicyRow, error:
     `INSERT INTO dead_letter_jobs (id, job_id, queue_id, reason, attempts, moved_at)
      VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(newId.dlq(), job.id, job.queue_id, error, job.attempts, now);
+  // A dead parent can never satisfy its children: cancel the whole subtree.
+  skipDependents(db, job.id, `dependency ${job.id} failed permanently`, now);
   return { outcome: 'dead' };
+}
+
+/**
+ * Cancel every not-yet-started descendant of a failed/canceled job
+ * (recursive: grandchildren too). Children keep their pending_deps counter,
+ * so a manual retry of the child stays gated until the parent is retried
+ * and completes — the DAG contract survives manual intervention.
+ */
+export function skipDependents(db: DB, jobId: string, reason: string, now: number = Date.now()): string[] {
+  const skipped = db
+    .prepare(
+      `WITH RECURSIVE descendants(id) AS (
+         SELECT job_id FROM job_dependencies WHERE depends_on = ?
+         UNION
+         SELECT d.job_id FROM job_dependencies d JOIN descendants ON descendants.id = d.depends_on
+       )
+       UPDATE jobs
+       SET status = 'canceled', completed_at = ?, last_error = ?,
+           claimed_by = NULL, lease_expires_at = NULL, updated_at = ?
+       WHERE id IN (SELECT id FROM descendants)
+         AND status IN ('scheduled','queued','retrying')
+       RETURNING id`,
+    )
+    .all(jobId, now, reason, now) as { id: string }[];
+  for (const row of skipped) {
+    appendJobLog(db, { jobId: row.id, level: 'warn', message: `Canceled: ${reason}`, now });
+  }
+  return skipped.map((r) => r.id);
 }
 
 export function resolveRetryPolicy(db: DB, policyId: string | null): RetryPolicyRow {

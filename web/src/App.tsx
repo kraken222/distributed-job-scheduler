@@ -10,8 +10,10 @@ import {
   ServerCog,
   ShieldCheck,
   Timer,
+  Zap,
 } from 'lucide-react';
 import { api, getToken, setToken } from './api';
+import { useLiveStatus } from './hooks';
 import { Login } from './pages/Login';
 import { Overview } from './pages/Overview';
 import { Queues } from './pages/Queues';
@@ -21,6 +23,7 @@ import { Workers } from './pages/Workers';
 import { Dlq } from './pages/Dlq';
 import { Schedules } from './pages/Schedules';
 import { Policies } from './pages/Policies';
+import { Events } from './pages/Events';
 
 export interface Project {
   id: string;
@@ -42,6 +45,7 @@ function Shell() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState<string | null>(localStorage.getItem('jobscheduler.project'));
   const location = useLocation();
+  const live = useLiveStatus();
 
   async function reloadProjects() {
     const res = await api<{ data: Project[] }>('/api/projects');
@@ -91,10 +95,15 @@ function Shell() {
             <NavLink to="/" end><LayoutDashboard size={16} /> Dashboard</NavLink>
             <NavLink to="/queues"><Layers size={16} /> Queues</NavLink>
             <NavLink to="/schedules"><CalendarClock size={16} /> Schedules</NavLink>
+            <NavLink to="/events"><Zap size={16} /> Events</NavLink>
             <NavLink to="/policies"><ShieldCheck size={16} /> Retry Policies</NavLink>
             <NavLink to="/workers"><ServerCog size={16} /> Workers</NavLink>
             <NavLink to="/dlq"><AlertTriangle size={16} /> Dead Letters</NavLink>
           </nav>
+          <div className="live-indicator" title={live ? 'Live updates over WebSocket' : 'WebSocket down — falling back to polling'}>
+            <span className={`live-dot ${live ? 'live-on' : 'live-off'}`} />
+            {live ? 'Live' : 'Polling'}
+          </div>
           <div className="sidebar-footer">
             <button
               onClick={() => {
@@ -114,6 +123,7 @@ function Shell() {
             <Route path="/queues/:queueId" element={<QueueDetail />} />
             <Route path="/jobs/:jobId" element={<JobDetail />} />
             <Route path="/schedules" element={<Schedules />} />
+            <Route path="/events" element={<Events />} />
             <Route path="/policies" element={<Policies />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/dlq" element={<Dlq />} />

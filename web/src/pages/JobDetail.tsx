@@ -1,5 +1,5 @@
-import { useParams } from 'react-router-dom';
-import { Ban, RotateCcw } from 'lucide-react';
+import { Link, useParams } from 'react-router-dom';
+import { Ban, GitBranch, RotateCcw } from 'lucide-react';
 import { api, fmtDuration, fmtTime } from '../api';
 import { ErrorBanner, JsonBlock, StatusBadge } from '../components';
 import { usePoll } from '../hooks';
@@ -12,6 +12,7 @@ export function JobDetail() {
   const job = usePoll(() => api(`/api/jobs/${jobId}`), [jobId], 2000);
   const executions = usePoll(() => api(`/api/jobs/${jobId}/executions`), [jobId], 2000);
   const logs = usePoll(() => api(`/api/jobs/${jobId}/logs`), [jobId], 2000);
+  const deps = usePoll(() => api(`/api/jobs/${jobId}/dependencies`), [jobId], 5000);
 
   const j = job.data;
 
@@ -60,6 +61,8 @@ export function JobDetail() {
             <div><span className="muted">Timeout</span> {fmtDuration(j.timeout_ms)}</div>
             <div><span className="muted">Batch</span> {j.batch_id ?? '—'}</div>
             <div><span className="muted">Idempotency key</span> {j.idempotency_key ?? '—'}</div>
+            <div><span className="muted">Shard</span> {j.shard_key ? `${j.shard} (key: ${j.shard_key})` : j.shard}</div>
+            <div><span className="muted">Waiting on</span> {j.pending_deps > 0 ? `${j.pending_deps} dependency(ies)` : '—'}</div>
           </div>
           {j.last_error && <div className="error-banner">Last error: {j.last_error}</div>}
           <div className="two-col">
@@ -72,6 +75,36 @@ export function JobDetail() {
               <JsonBlock value={j.result} />
             </div>
           </div>
+        </section>
+      )}
+
+      {deps.data && (deps.data.parents.length > 0 || deps.data.children.length > 0) && (
+        <section className="panel">
+          <h2><GitBranch size={16} style={{ verticalAlign: -2 }} /> Workflow dependencies</h2>
+          {deps.data.parents.length > 0 && (
+            <>
+              <p className="panel-sub">Runs after:</p>
+              {deps.data.parents.map((p: any) => (
+                <div className="dep-row" key={p.id}>
+                  <StatusBadge status={p.status} />
+                  <Link to={`/jobs/${p.id}`} className="mono">{p.id}</Link>
+                  <span className="muted">{p.type}</span>
+                </div>
+              ))}
+            </>
+          )}
+          {deps.data.children.length > 0 && (
+            <>
+              <p className="panel-sub" style={{ marginTop: deps.data.parents.length > 0 ? 12 : 0 }}>Unblocks:</p>
+              {deps.data.children.map((c: any) => (
+                <div className="dep-row" key={c.id}>
+                  <StatusBadge status={c.status} />
+                  <Link to={`/jobs/${c.id}`} className="mono">{c.id}</Link>
+                  <span className="muted">{c.type}</span>
+                </div>
+              ))}
+            </>
+          )}
         </section>
       )}
 

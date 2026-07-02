@@ -189,6 +189,72 @@ const migrations: string[] = [
   );
   CREATE INDEX idx_dlq_queue ON dead_letter_jobs(queue_id, moved_at DESC);
   `,
+
+  /* ---- v2: workflow dependencies, rate limiting, sharding, events, failure summaries ---- */ `
+  -- Rate limiting: at most rate_limit_max execution *starts* per sliding
+  -- rate_limit_window_ms window, enforced fleet-wide in the claim transaction.
+  -- NULL = unlimited.
+  ALTER TABLE queues ADD COLUMN rate_limit_max INTEGER
+    CHECK (rate_limit_max IS NULL OR rate_limit_max >= 1);
+  ALTER TABLE queues ADD COLUMN rate_limit_window_ms INTEGER
+    CHECK (rate_limit_window_ms IS NULL OR rate_limit_window_ms >= 100);
+
+  -- Sharding: jobs hash (by shard_key, else job id) onto [0, shard_count).
+  -- Workers may pin themselves to a shard subset via WORKER_SHARDS.
+  ALTER TABLE queues ADD COLUMN shard_count INTEGER NOT NULL DEFAULT 1
+    CHECK (shard_count >= 1);
+  ALTER TABLE jobs ADD COLUMN shard INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE jobs ADD COLUMN shard_key TEXT;
+
+  -- Workflow dependencies: denormalized count of incomplete parents. The
+  -- claim query gates on pending_deps = 0; completeJob decrements children.
+  ALTER TABLE jobs ADD COLUMN pending_deps INTEGER NOT NULL DEFAULT 0
+    CHECK (pending_deps >= 0);
+
+  CREATE TABLE job_dependencies (
+    job_id     TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    depends_on TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (job_id, depends_on)
+  ) WITHOUT ROWID;
+  -- Parent -> children lookup: completion fan-out and failure cascade.
+  CREATE INDEX idx_deps_parent ON job_dependencies(depends_on);
+
+  -- AI/heuristic failure summaries, filled in asynchronously by the API
+  -- process after a job dead-letters.
+  ALTER TABLE dead_letter_jobs ADD COLUMN summary TEXT;
+  ALTER TABLE dead_letter_jobs ADD COLUMN summary_source TEXT
+    CHECK (summary_source IS NULL OR summary_source IN ('ai','heuristic'));
+
+  -- Event-driven execution: emitted events fan out to jobs via triggers.
+  CREATE TABLE events (
+    id           TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    payload      TEXT,
+    jobs_created INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL
+  );
+  CREATE INDEX idx_events_project ON events(project_id, created_at DESC);
+
+  CREATE TABLE event_triggers (
+    id         TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    queue_id   TEXT NOT NULL REFERENCES queues(id) ON DELETE CASCADE,
+    event_name TEXT NOT NULL,
+    job_type   TEXT NOT NULL,
+    payload    TEXT,
+    priority   INTEGER NOT NULL DEFAULT 0,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  -- Emit path: find enabled triggers for (project, event name).
+  CREATE INDEX idx_triggers_lookup ON event_triggers(project_id, event_name, enabled);
+
+  -- Rate limiter counts execution starts inside the window.
+  CREATE INDEX idx_executions_started ON job_executions(started_at);
+  `,
 ];
 
 /** Built-in retry policies inserted once; queues without an explicit policy fall back to "default". */

@@ -97,8 +97,8 @@ local slot count.
 concurrent calls against this rate-limited third-party API" once you run more than one
 worker. Doing it in the claim transaction makes the limit exact (no TOCTOU between reading
 counts and claiming), which is also why the check and the claim are one SQL statement pair
-under one write lock. This doubles as a coarse **rate limiter** (bonus feature) at
-concurrency granularity.
+under one write lock. Time-window **rate limiting** (§13) is enforced at the same point for
+the same reason.
 
 ## 8. Coordinator loops live in the API process but are multi-instance safe
 
@@ -111,15 +111,24 @@ question, no distributed-lock infrastructure — but scaling the API horizontall
 double-fires a schedule. A dedicated scheduler deployment would only become worthwhile when
 scheduler work itself needs isolation.
 
-## 9. Polling dashboard instead of WebSockets
+## 9. WebSockets as a notification channel, polling as the fallback
 
-**Decision**: the React dashboard polls (2–5s, paused when the tab is hidden).
+**Decision**: the dashboard holds a WebSocket (`/api/ws`, JWT verified on upgrade) that
+carries only "something changed" pings; clients react by re-running their existing REST
+fetchers (poll-on-notify). Polling (2–5s, paused when the tab is hidden) stays on as the
+fallback transport.
 
-**Why**: at dashboard scale, polling indexed aggregate queries is cheap, survives proxies
-and reconnects for free, and keeps the server stateless. WebSockets add fan-out state,
-auth-on-upgrade and reconnect logic for a marginal freshness gain. The clean upgrade path is
-SSE/WS as a *notification* channel that triggers the existing fetchers (poll-on-notify), so
-no business logic would change.
+**Why push-without-payload**: pushing *data* over the socket would duplicate the REST
+layer's tenancy filtering, pagination and shapes in a second protocol — the classic way
+multi-tenant systems grow authorization bugs. Pushing only a ping keeps authorization in
+exactly one place, makes a dropped socket degrade to plain polling (nothing breaks, the UI
+just gets ~3s staler), and keeps the server nearly stateless.
+
+**Cross-process change detection**: workers are separate processes, so the API cannot see
+their writes via an in-process bus. SQLite's `data_version` pragma (bumps whenever *another
+connection* commits) is polled cheaply to catch worker writes; API-local mutations notify
+an in-process bus directly. Both paths feed one debounced broadcast, so a burst of commits
+becomes a single ping. On Postgres this whole mechanism collapses into `LISTEN/NOTIFY`.
 
 ## 10. Cancellation is cooperative; running jobs can't be force-killed
 
@@ -157,11 +166,87 @@ operations — as fine-grained permissions weren't the evaluation focus.
   executions kept forever by design (they're the audit trail) with archiving named as the
   production follow-up.
 
-## Bonus features implemented
+## 13. Rate limiting: sliding window over execution *starts*, enforced in the claim
 
-- **Rate limiting** (coarse): fleet-wide per-queue concurrency caps (§7).
+**Decision**: per-queue `rate_limit_max` / `rate_limit_window_ms` cap execution **starts**
+per sliding window, fleet-wide. Enforcement lives in the claim transaction: free slots =
+`MIN(concurrency headroom, rate tokens)`, where tokens = limit − starts-in-window −
+claimed-but-not-yet-started jobs.
+
+**Why starts, not completions**: the thing a downstream API cares about is how often you
+*hit* it; counting completions would let N slow jobs burst-start together. Counting
+claimed-but-unstarted jobs closes the gap where a burst claim precedes its starts — without
+it a worker could claim 50 jobs in one transaction and start them all inside a single
+window. Because the count and the claim run under the same write lock, the limit is exact
+across any number of workers; there is no token-bucket state to keep consistent — the
+`job_executions` table already *is* the ledger. Retries consume tokens like first attempts,
+deliberately: the downstream service does not care which attempt is calling it.
+
+## 14. Workflow dependencies: a denormalized gate, not a graph walker
+
+**Decision**: `job_dependencies` stores the DAG edges; each job carries a `pending_deps`
+counter. The claim query gates on `pending_deps = 0`; completing a parent decrements its
+children; a permanently failed or canceled parent recursively cancels its descendants.
+`POST /queues/:id/workflows` creates a whole DAG atomically (keys + topological creation,
+cycles rejected with Kahn's algorithm).
+
+**Why a counter**: the alternative — a claim-time `NOT EXISTS (incomplete parent)` subquery
+— re-walks edges on every poll of every worker, the hottest path in the system. The counter
+moves that cost to completion time (once per parent, not once per poll) and is maintained
+inside the same transactions that transition state, so it cannot drift. Failure semantics
+are the strict ones (dead parent ⇒ canceled subtree, like a failed CI stage): silently
+running children whose inputs never materialized is the wrong default, and a canceled child
+still remembers its `pending_deps`, so manually retrying parent-then-child works correctly.
+
+## 15. Sharding: stable hash placement + voluntary worker pinning
+
+**Decision**: queues declare `shard_count`; jobs hash onto a shard by `shard_key` (FNV-1a,
+falling back to the job id when keyless); workers started with `WORKER_SHARDS=0,2` only
+claim those shards. Placement is recorded on the job row at enqueue time.
+
+**Why**: sharding here is *partitioning*, not extra queues — all of a tenant's jobs land on
+one shard, so an operator can dedicate workers to a noisy tenant (or spread load across
+worker pools) without new queue topology. Recording the shard at enqueue keeps claims an
+indexed equality filter, at the documented cost that resizing `shard_count` only affects
+future jobs. Pinning is voluntary (unpinned workers see all shards) so the failure mode of
+a dead pinned worker is degraded latency, not a stuck shard.
+
+## 16. Event-driven execution: events are facts, triggers are subscriptions
+
+**Decision**: `POST /projects/:id/events` records an immutable event and, in the same
+transaction, fans out one job per enabled matching trigger. Triggers map an event name to
+(queue, job type, payload template); the job payload carries the full event envelope.
+
+**Why**: the event insert and its fan-out commit atomically, so an emitted event is never
+half-processed — the guarantee webhook-style async processing usually lacks. Keeping events
+as stored rows (with `jobs_created`) gives an audit trail: "what did this event cause?" is
+a query, not archaeology. Matching is exact-name and project-scoped; wildcard routing was
+deliberately skipped as the first version of every rules engine that ends up needing a
+debugger of its own.
+
+## 17. AI failure summaries: asynchronous, with a deterministic floor
+
+**Decision**: when a job dead-letters, a coordinator loop later attaches a diagnosis to the
+DLQ entry. With `ANTHROPIC_API_KEY` set it asks Claude (payload shape, per-attempt errors,
+log tail); otherwise — and on any AI error — a rule-based heuristic classifier produces the
+summary (timeout patterns, connectivity errors, HTTP status classes, deterministic-vs-flaky
+across attempts). The row records which engine wrote it (`summary_source`).
+
+**Why asynchronous**: an LLM call has no place inside a worker's failure transaction — the
+job must dead-letter instantly even if the summarizer is down. **Why the heuristic floor**:
+the feature must work for a reviewer without an API key, degrade gracefully in production,
+and be testable offline; the AI path then upgrades quality when available rather than being
+a hard dependency. The summarizer is idempotent (`WHERE summary IS NULL`), so multiple API
+instances can run it safely.
+
+## Bonus features: all eight implemented
+
+- **Rate limiting**: exact sliding-window limits on execution starts (§13).
 - **Distributed locking**: the claim transaction itself is the lock (§2), and the CAS on
   `scheduled_jobs.next_run_at` is an optimistic lock for schedule firing (§8).
 - **RBAC**: admin/member roles guarding destructive operations (§11).
-- Explicitly **not** implemented (scope control): workflow dependencies, queue sharding,
-  event-driven execution, WebSocket push, AI failure summaries.
+- **Workflow dependencies**: DAGs with atomic creation, cycle rejection, failure cascade (§14).
+- **Queue sharding**: stable hash placement with worker pinning (§15).
+- **Event-driven execution**: events + triggers with atomic fan-out (§16).
+- **WebSocket live updates**: authenticated poll-on-notify push (§9).
+- **AI failure summaries**: Claude-generated diagnoses with a deterministic fallback (§17).

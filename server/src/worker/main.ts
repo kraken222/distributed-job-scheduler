@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { openDatabase } from '../db/connection.js';
+import { parseShardList } from '../core/shard.js';
 import { Worker } from './worker.js';
 
 const db = openDatabase();
@@ -10,6 +11,7 @@ const worker = new Worker(db, {
   pollMs: config.workerPollMs,
   heartbeatMs: config.heartbeatMs,
   leaseMs: config.leaseMs,
+  shards: parseShardList(config.workerShards),
 });
 
 let stopping = false;

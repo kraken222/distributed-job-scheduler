@@ -55,6 +55,11 @@ export interface JobRow {
   completed_at: number | null;
   last_error: string | null;
   result: string | null;
+  /** Shard index in [0, queue.shard_count); always 0 for unsharded queues. */
+  shard: number;
+  shard_key: string | null;
+  /** Number of dependency parents that have not completed yet; claimable only at 0. */
+  pending_deps: number;
   created_at: number;
   updated_at: number;
 }
@@ -67,6 +72,11 @@ export interface QueueRow {
   concurrency_limit: number;
   is_paused: number;
   retry_policy_id: string | null;
+  /** Sliding-window rate limit (NULL = unlimited): max execution starts per window. */
+  rate_limit_max: number | null;
+  rate_limit_window_ms: number | null;
+  /** Number of shards jobs hash onto; 1 = unsharded. */
+  shard_count: number;
   created_at: number;
   updated_at: number;
 }
@@ -123,4 +133,29 @@ export interface DeadLetterRow {
   moved_at: number;
   requeued_at: number | null;
   requeued_job_id: string | null;
+  /** Human-readable failure diagnosis, generated asynchronously. */
+  summary: string | null;
+  summary_source: 'ai' | 'heuristic' | null;
+}
+
+export interface EventRow {
+  id: string;
+  project_id: string;
+  name: string;
+  payload: string | null;
+  jobs_created: number;
+  created_at: number;
+}
+
+export interface EventTriggerRow {
+  id: string;
+  project_id: string;
+  queue_id: string;
+  event_name: string;
+  job_type: string;
+  payload: string | null;
+  priority: number;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
 }

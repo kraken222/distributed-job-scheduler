@@ -11,6 +11,8 @@ export interface WorkerOptions {
   pollMs: number;
   heartbeatMs: number;
   leaseMs: number;
+  /** Shard pinning: only claim jobs on these shards (undefined = all). */
+  shards?: number[];
 }
 
 /**
@@ -49,7 +51,10 @@ export class Worker {
     const row = registerWorker(this.db, { name: this.opts.name, concurrency: this.opts.concurrency });
     this.id = row.id;
     this.running = true;
-    this.log.info({ workerId: this.id, concurrency: this.opts.concurrency }, 'worker online');
+    this.log.info(
+      { workerId: this.id, concurrency: this.opts.concurrency, shards: this.opts.shards ?? 'all' },
+      'worker online',
+    );
 
     this.heartbeatTimer = setInterval(() => {
       try {
@@ -64,7 +69,7 @@ export class Worker {
       let claimed: JobRow[] = [];
       if (free > 0 && !this.draining) {
         try {
-          claimed = claimJobs(this.db, this.id, free, { leaseMs: this.opts.leaseMs });
+          claimed = claimJobs(this.db, this.id, free, { leaseMs: this.opts.leaseMs, shards: this.opts.shards });
         } catch (err) {
           this.log.error({ err }, 'claim failed');
         }

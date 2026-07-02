@@ -14,6 +14,9 @@ interface QueueConfig {
   priority: number;
   concurrencyLimit: number;
   retryPolicyId: string | null;
+  rateLimitMax: number | null;
+  rateLimitWindowMs: number | null;
+  shardCount: number;
 }
 
 export function QueueDetail() {
@@ -29,6 +32,7 @@ export function QueueDetail() {
     runAt: '',
     priority: 0,
     count: 1,
+    shardKey: '',
   });
   const [config, setConfig] = useState<QueueConfig | null>(null);
 
@@ -51,6 +55,7 @@ export function QueueDetail() {
     try {
       const payload = jobForm.payload.trim() ? JSON.parse(jobForm.payload) : undefined;
       const base: Record<string, unknown> = { type: jobForm.type, payload, priority: jobForm.priority };
+      if (jobForm.shardKey.trim()) base.shardKey = jobForm.shardKey.trim();
       if (jobForm.runAt) {
         const runAt = new Date(jobForm.runAt).getTime();
         if (Number.isNaN(runAt)) throw new Error('Invalid run-at time');
@@ -107,7 +112,14 @@ export function QueueDetail() {
             </button>
             <button
               onClick={() =>
-                setConfig({ priority: q.priority, concurrencyLimit: q.concurrency_limit, retryPolicyId: q.retry_policy_id })
+                setConfig({
+                  priority: q.priority,
+                  concurrencyLimit: q.concurrency_limit,
+                  retryPolicyId: q.retry_policy_id,
+                  rateLimitMax: q.rate_limit_max,
+                  rateLimitWindowMs: q.rate_limit_window_ms,
+                  shardCount: q.shard_count,
+                })
               }
             >
               <Settings2 size={16} /> Configure
@@ -138,6 +150,33 @@ export function QueueDetail() {
                 onChange={(retryPolicyId) => setConfig({ ...config, retryPolicyId })}
               />
             </label>
+            <label className="field-inline" title="Max execution starts per window (fleet-wide). Leave empty for unlimited.">
+              rate limit (starts)
+              <input
+                type="number" min={1} placeholder="∞"
+                value={config.rateLimitMax ?? ''}
+                onChange={(e) => setConfig({ ...config, rateLimitMax: e.target.value === '' ? null : Number(e.target.value) })}
+                style={{ width: 100 }}
+              />
+            </label>
+            <label className="field-inline" title="Sliding window size for the rate limit.">
+              per window (ms)
+              <input
+                type="number" min={100} placeholder="—"
+                value={config.rateLimitWindowMs ?? ''}
+                onChange={(e) => setConfig({ ...config, rateLimitWindowMs: e.target.value === '' ? null : Number(e.target.value) })}
+                style={{ width: 110 }}
+              />
+            </label>
+            <label className="field-inline" title="Jobs hash onto shards by shard key; workers can pin to shards via WORKER_SHARDS.">
+              shards
+              <input
+                type="number" min={1} max={64}
+                value={config.shardCount}
+                onChange={(e) => setConfig({ ...config, shardCount: Number(e.target.value) })}
+                style={{ width: 80 }}
+              />
+            </label>
             <button className="primary">Save</button>
             <button type="button" onClick={() => setConfig(null)}>Cancel</button>
           </form>
@@ -150,6 +189,11 @@ export function QueueDetail() {
           <StatCard label="Running" value={`${q.stats.running} / ${q.concurrency_limit}`} />
           <StatCard label="Completed (1h)" value={q.stats.completedLastHour} tone="ok" />
           <StatCard label="Failed (1h)" value={q.stats.failedLastHour} tone={q.stats.failedLastHour > 0 ? 'bad' : undefined} />
+          <StatCard
+            label="Rate limit"
+            value={q.rate_limit_max ? `${q.rate_limit_max} / ${(q.rate_limit_window_ms / 1000).toFixed(0)}s` : 'none'}
+          />
+          <StatCard label="Shards" value={q.shard_count} />
         </div>
       )}
 
@@ -202,6 +246,12 @@ export function QueueDetail() {
             count
             <input type="number" min={1} max={500} value={jobForm.count} onChange={(e) => setJobForm({ ...jobForm, count: Number(e.target.value) })} style={{ width: 80 }} />
           </label>
+          {q && q.shard_count > 1 && (
+            <label className="field-inline" title="Jobs with the same shard key run on the same shard.">
+              shard key
+              <input placeholder="optional" value={jobForm.shardKey} onChange={(e) => setJobForm({ ...jobForm, shardKey: e.target.value })} style={{ width: 120 }} />
+            </label>
+          )}
           <button className="primary">
             <Plus size={16} /> Enqueue
           </button>

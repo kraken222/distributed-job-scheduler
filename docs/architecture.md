@@ -7,18 +7,20 @@ The system is three deployable units sharing one database:
 ```mermaid
 flowchart LR
     subgraph Clients
-        UI[React Dashboard<br/>polling 2–5s]
-        CLI[API clients / curl]
+        UI[React Dashboard<br/>WebSocket live updates<br/>+ polling fallback]
+        CLI[API clients / curl<br/>emit events, enqueue jobs]
     end
 
     subgraph API["API process (scale horizontally)"]
-        REST[Express REST API<br/>JWT auth · zod validation]
+        REST[Express REST API<br/>JWT auth · zod validation<br/>events → trigger fan-out]
+        WS[WebSocket hub<br/>poll-on-notify pings]
         SCHED[Cron scheduler<br/>materializes due schedules]
         REAPER[Reaper<br/>recovers expired leases,<br/>marks lost workers]
+        SUMM[Failure summarizer<br/>AI / heuristic DLQ diagnoses]
     end
 
     subgraph Workers["Worker fleet (scale horizontally)"]
-        W1[Worker 1<br/>claim → execute → heartbeat]
+        W1[Worker 1<br/>claim → execute → heartbeat<br/>optional shard pinning]
         W2[Worker 2]
         WN[Worker N]
     end
@@ -26,10 +28,13 @@ flowchart LR
     DB[(SQLite / WAL<br/>single source of truth<br/>→ Postgres in production)]
 
     UI -->|HTTPS| REST
+    UI <-.->|WS ping| WS
     CLI -->|HTTPS| REST
     REST --> DB
+    WS --> DB
     SCHED --> DB
     REAPER --> DB
+    SUMM --> DB
     W1 <--> DB
     W2 <--> DB
     WN <--> DB
@@ -44,7 +49,7 @@ with atomic claims; nothing pushes work to them. This keeps the system simple, t
 
 ### API process (`server/src/api`)
 
-Serves REST and hosts two background coordinator loops:
+Serves REST, hosts the WebSocket hub, and runs three background coordinator loops:
 
 - **Cron scheduler** (`core/scheduler.ts`, 1s tick): finds `scheduled_jobs` with
   `next_run_at <= now`, advances `next_run_at` with a **compare-and-set**
@@ -53,6 +58,14 @@ Serves REST and hosts two background coordinator loops:
   the loop concurrently and a firing is still enqueued exactly once.
 - **Reaper** (`core/reaper.ts`, 5s tick): marks workers with stale heartbeats `lost` and
   recovers their jobs (details under *Failure recovery*).
+- **Failure summarizer** (`core/failureSummary.ts`, 5s tick): attaches a diagnosis to new
+  DLQ entries — Claude-generated when `ANTHROPIC_API_KEY` is set, a deterministic
+  heuristic classifier otherwise. Idempotent (`WHERE summary IS NULL`), so it is
+  multi-instance safe like the other loops.
+
+**Event-driven execution** also lives here: `POST /projects/:id/events` records the event
+and fans out one job per enabled matching `event_trigger` in the same transaction
+(`core/events.ts`), so an event is never half-processed.
 
 ### Worker (`server/src/worker`)
 
@@ -61,7 +74,8 @@ A long-running process, N per deployment:
 1. **Registers** itself in `workers` and starts a heartbeat timer (3s) that also renews
    the leases of its in-flight jobs.
 2. **Poll loop**: when it has free slots, atomically claims up to that many due jobs
-   (single `IMMEDIATE` transaction — see *Atomic claiming*).
+   (single `IMMEDIATE` transaction — see *Atomic claiming*). A worker started with
+   `WORKER_SHARDS=0,2` claims only jobs on those shards of sharded queues.
 3. **Executes** each claimed job concurrently: `claimed → running` (+ execution row,
    attempt counter), runs the registered handler racing a per-job timeout
    (`AbortSignal` passed to the handler for cooperative cancellation).
@@ -73,9 +87,9 @@ A long-running process, N per deployment:
 
 ### Dashboard (`web/`)
 
-React SPA. All data flows through the same authenticated REST API, refreshed by a
-visibility-aware polling hook (2–5s). No privileged backdoors: the UI can do exactly
-what the API allows.
+React SPA. All data flows through the same authenticated REST API, refreshed instantly by
+WebSocket change notifications with a visibility-aware polling hook (2–5s) as fallback.
+No privileged backdoors: the UI can do exactly what the API allows.
 
 ## Job lifecycle
 
@@ -91,25 +105,39 @@ stateDiagram-v2
     running --> retrying: handler throws / times out / worker lost,<br/>attempts &lt; max
     running --> dead: attempts exhausted → DLQ entry
     retrying --> claimed: backoff elapsed + claimed
-    scheduled --> canceled: user cancel
-    queued --> canceled: user cancel
-    retrying --> canceled: user cancel
+    scheduled --> canceled: user cancel / dependency failed
+    queued --> canceled: user cancel / dependency failed
+    retrying --> canceled: user cancel / dependency failed
     dead --> queued: manual retry / DLQ requeue (attempts reset)
     completed --> [*]
     canceled --> [*]
 ```
 
+**Workflow dependencies** overlay this machine: a job with incomplete parents stays in
+`queued`/`scheduled` but is invisible to claims until `pending_deps = 0` (each completing
+parent decrements it). A parent that dies or is canceled recursively cancels its
+descendants — a DAG never half-runs on missing inputs.
+
 ## Atomic claiming (no duplicate execution)
 
 Claiming runs in a single `BEGIN IMMEDIATE` transaction (`core/claims.ts`):
 
-1. A CTE computes per-queue **free capacity**: `concurrency_limit − count(claimed|running)`,
-   skipping paused queues.
-2. Candidates are ranked with a window function (`ROW_NUMBER() PARTITION BY queue`) so one
-   claim never exceeds any queue's remaining capacity, ordered by
+1. A CTE computes per-queue **free slots** as
+   `MIN(concurrency headroom, rate-limit tokens)`, skipping paused queues:
+   - concurrency headroom: `concurrency_limit − count(claimed|running)`;
+   - rate tokens (when the queue has a limit): `rate_limit_max − execution starts inside
+     the sliding window − claimed-but-not-yet-started jobs`.
+2. Candidates are filtered to **runnable** jobs only — due (`run_at <= now`), all
+   dependencies complete (`pending_deps = 0`), and on the worker's shards if it is pinned —
+   then ranked with a window function (`ROW_NUMBER() PARTITION BY queue`) so one claim
+   never exceeds any queue's remaining capacity, ordered by
    queue priority → job priority → `run_at` → `created_at` (FIFO).
 3. `UPDATE jobs SET status='claimed', claimed_by=?, lease_expires_at=? WHERE id IN (…)
    AND status IN ('queued','scheduled','retrying') RETURNING *`.
+
+Because concurrency limits, rate limits and the dependency gate are all evaluated inside
+the same write lock that performs the claim, they are exact across the whole fleet — there
+is no window in which two workers can both "see" the last free slot.
 
 SQLite serializes writers across processes, so two workers can never claim the same row —
 the same guarantee `SELECT … FOR UPDATE SKIP LOCKED` gives on Postgres (the query maps
@@ -134,9 +162,21 @@ effects but before committing `completed` will run again. Handlers are therefore
 to be idempotent, and the API supports **idempotency keys** at enqueue time
 (`UNIQUE(queue_id, idempotency_key)`) to deduplicate producers.
 
-## Live updates
+## Live updates (WebSocket, poll-on-notify)
 
-The dashboard polls. WebSockets were considered and deliberately deferred: polling every
-2–5s against indexed count queries is cheap at this scale, works through any proxy,
-and has no reconnect/fan-out complexity. The API is structured so a WS/SSE layer could be
-added as a thin notification channel (poll-on-notify) without touching business logic.
+The dashboard opens `/api/ws` (JWT verified during the HTTP upgrade). The socket carries
+**no data** — only debounced `{type:"changed"}` pings; on each ping the client re-runs its
+existing REST fetchers, so tenancy filtering and response shapes stay implemented exactly
+once, in the REST layer.
+
+Change detection covers both writer populations:
+
+- **API-local mutations** (enqueue, cancel, config changes) notify an in-process bus from a
+  single middleware — no per-route instrumentation to forget.
+- **Worker processes** share the SQLite file but not the API's memory; their commits are
+  detected via the `data_version` pragma (bumps whenever another connection commits),
+  polled every 750ms. On Postgres both paths collapse into `LISTEN/NOTIFY`.
+
+If the socket drops, the client reconnects with backoff and meanwhile the polling hook
+(2–5s, visibility-aware) keeps the UI correct — live updates are an accelerator, never a
+single point of failure.
